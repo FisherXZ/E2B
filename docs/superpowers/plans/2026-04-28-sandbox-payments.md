@@ -1292,18 +1292,33 @@ Wraps httpx.Client and httpx.AsyncClient to handle HTTP 402 responses automatica
 """
 
 import base64
+import fcntl
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 _PRIVATE_KEY = os.environ.get("E2B_PAYMENT_PRIVATE_KEY", "")
 _NETWORK = os.environ.get("E2B_PAYMENT_NETWORK", "base-sepolia")
+# USDC EIP-712 domain version. Override with E2B_PAYMENT_USDC_VERSION if Coinbase
+# upgrades the contract implementation (as they did on Ethereum: "2" → "2.2").
+# The correct way to eliminate this entirely is to call DOMAIN_SEPARATOR() on the
+# contract at runtime and pass it directly — but that costs one extra RPC call.
+_USDC_VERSION = os.environ.get("E2B_PAYMENT_USDC_VERSION", "2")
 _PAYMENTS_LOG = Path("/tmp/.e2b-payments.jsonl")
 _SPEND_LIMIT_FILE = Path("/tmp/.e2b-payment-limit")
+_PAYMENT_LOCK = Path("/tmp/.e2b-payment-lock")
 
 _CHAIN_IDS = {"base": 8453, "base-sepolia": 84532}
+
+# Re-entrancy guard: prevents the interceptor firing on its own internal httpx calls.
+_payment_in_progress = threading.local()
+
+# E2B's own REST API must never be intercepted — it may legitimately return 402
+# for quota enforcement, and patching those calls risks sending wallet funds to E2B.
+_E2B_API_HOSTS = frozenset({"api.e2b.dev", "api.e2b.io"})
 
 
 class SpendingLimitExceeded(Exception):
@@ -1317,37 +1332,48 @@ def _get_account():
     return Account.from_key(_PRIVATE_KEY)
 
 
-def _check_spending_limit(amount_usd: float) -> None:
-    if not _SPEND_LIMIT_FILE.exists():
-        return
-    limit_str = _SPEND_LIMIT_FILE.read_text().strip()
-    if not limit_str:
-        return
-    limit = float(limit_str)
-    spent = 0.0
-    if _PAYMENTS_LOG.exists():
-        for line in _PAYMENTS_LOG.read_text().splitlines():
-            if line.strip():
-                event = json.loads(line)
-                if event.get("status") == "success":
-                    spent += event.get("amount_usd", 0)
-    if spent + amount_usd > limit:
-        raise SpendingLimitExceeded(
-            f"Payment of ${amount_usd:.4f} would exceed spending limit of ${limit:.4f} "
-            f"(spent so far: ${spent:.4f})"
-        )
+def _check_and_log_payment(amount_usd: float, url: str, tx_hash: str, status: str) -> None:
+    """Check spending limit and append log entry atomically under an exclusive file lock.
 
-
-def _log_payment(url: str, amount_usd: float, tx_hash: str, status: str) -> None:
-    event = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "url": url,
-        "amount_usd": amount_usd,
-        "tx_hash": tx_hash,
-        "status": status,
-    }
-    with _PAYMENTS_LOG.open("a") as f:
-        f.write(json.dumps(event) + "\n")
+    Combining the check and write in one locked section eliminates the TOCTOU race
+    where concurrent requests all read the same cumulative total and each pass the check.
+    """
+    _PAYMENT_LOCK.touch(exist_ok=True)
+    with open(_PAYMENT_LOCK, "r") as lock_f:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            if _SPEND_LIMIT_FILE.exists():
+                limit_str = _SPEND_LIMIT_FILE.read_text().strip()
+                if limit_str:
+                    limit = float(limit_str)
+                    spent = 0.0
+                    if _PAYMENTS_LOG.exists():
+                        for line in _PAYMENTS_LOG.read_text().splitlines():
+                            if line.strip():
+                                try:
+                                    event = json.loads(line)
+                                    if event.get("status") == "success":
+                                        # USDC has 6 decimal places, not 18
+                                        spent += event.get("amount_usd", 0)
+                                except json.JSONDecodeError:
+                                    pass  # skip corrupt lines, don't block payments
+                    if spent + amount_usd > limit:
+                        raise SpendingLimitExceeded(
+                            f"Payment of ${amount_usd:.4f} would exceed spending limit "
+                            f"of ${limit:.4f} (spent so far: ${spent:.4f})"
+                        )
+            # Write while still holding the lock — atomic check-then-write
+            event = {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "url": url,
+                "amount_usd": amount_usd,
+                "tx_hash": tx_hash,
+                "status": status,
+            }
+            with _PAYMENTS_LOG.open("a") as f:
+                f.write(json.dumps(event) + "\n")
+        finally:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)
 
 
 def _build_payment_header(payment_requirements: dict) -> str:
@@ -1363,47 +1389,45 @@ def _build_payment_header(payment_requirements: dict) -> str:
     pay_to = payment_requirements["payToAddress"]
     amount = int(payment_requirements["maxAmountRequired"])
     deadline = int(time.time()) + int(payment_requirements.get("requiredDeadlineSeconds", 300))
+    # bytes32 nonce: 32 cryptographically random bytes
     nonce = bytes.fromhex(_secrets.token_hex(32))
 
     chain_id = _CHAIN_IDS.get(_NETWORK, 84532)
 
-    structured_data = {
-        "domain": {
-            "name": "USD Coin",
-            "version": "2",
-            "chainId": chain_id,
-            "verifyingContract": usdc_address,
-        },
-        "message": {
-            "from": account.address,
-            "to": pay_to,
-            "value": amount,
-            "validAfter": 0,
-            "validBefore": deadline,
-            "nonce": nonce,
-        },
-        "primaryType": "TransferWithAuthorization",
-        "types": {
-            "EIP712Domain": [
-                {"name": "name", "type": "string"},
-                {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
-                {"name": "verifyingContract", "type": "address"},
-            ],
-            "TransferWithAuthorization": [
-                {"name": "from", "type": "address"},
-                {"name": "to", "type": "address"},
-                {"name": "value", "type": "uint256"},
-                {"name": "validAfter", "type": "uint256"},
-                {"name": "validBefore", "type": "uint256"},
-                {"name": "nonce", "type": "bytes32"},
-            ],
-        },
+    # eth-account >= 0.9.0 API: domain_data, message_types, and message_data are
+    # separate positional arguments. EIP712Domain must NOT appear in message_types —
+    # eth-account raises ValueError("EIP712Domain type is not allowed in message_types")
+    # if it does. The full_message= kwarg form was removed in 0.9.0.
+    domain_data = {
+        "name": "USD Coin",
+        "version": _USDC_VERSION,
+        "chainId": chain_id,
+        "verifyingContract": usdc_address,
+    }
+    message_types = {
+        "TransferWithAuthorization": [
+            {"name": "from", "type": "address"},
+            {"name": "to", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "validAfter", "type": "uint256"},
+            {"name": "validBefore", "type": "uint256"},
+            {"name": "nonce", "type": "bytes32"},
+        ],
+    }
+    message_data = {
+        "from": account.address,
+        "to": pay_to,
+        "value": amount,
+        "validAfter": 0,
+        "validBefore": deadline,
+        "nonce": nonce,
     }
 
     signed = Account.sign_typed_data(
         _PRIVATE_KEY,
-        full_message=structured_data,
+        domain_data=domain_data,
+        message_types=message_types,
+        message_data=message_data,
     )
 
     payload = {
@@ -1425,27 +1449,22 @@ def _build_payment_header(payment_requirements: dict) -> str:
     return base64.b64encode(json.dumps(payload).encode()).decode()
 
 
-def _handle_402(response, request_fn, original_request):
+def _handle_sync_402(response, request_fn, original_request):
     """Handle a 402 response: sign payment and retry."""
-    account = _get_account()
-    if account is None:
-        return response
-
     try:
         payment_requirements = response.json()
     except Exception:
         return response
 
+    # USDC has 6 decimal places, not 18 like most ERC-20 tokens
     amount_usd = int(payment_requirements.get("maxAmountRequired", 0)) / 1e6
-    _check_spending_limit(amount_usd)
-
     payment_header = _build_payment_header(payment_requirements)
     original_request.headers["X-PAYMENT"] = payment_header
     retry_response = request_fn(original_request)
 
     tx_hash = retry_response.headers.get("X-PAYMENT-RESPONSE", "unknown")
     status = "success" if retry_response.status_code != 402 else "failed"
-    _log_payment(str(original_request.url), amount_usd, tx_hash, status)
+    _check_and_log_payment(amount_usd, str(original_request.url), tx_hash, status)
 
     return retry_response
 
@@ -1458,9 +1477,23 @@ if _PRIVATE_KEY:
         _original_send = httpx.Client.send
 
         def _patched_send(self, request, **kwargs):
+            # Skip if we're already inside a payment handler (re-entrancy guard)
+            if getattr(_payment_in_progress, "active", False):
+                return _original_send(self, request, **kwargs)
+            # Never intercept E2B's own API calls
+            if str(request.url.host) in _E2B_API_HOSTS:
+                return _original_send(self, request, **kwargs)
             response = _original_send(self, request, **kwargs)
             if response.status_code == 402:
-                return _handle_402(response, lambda req: _original_send(self, req, **kwargs), request)
+                _payment_in_progress.active = True
+                try:
+                    return _handle_sync_402(
+                        response,
+                        lambda req: _original_send(self, req, **kwargs),
+                        request,
+                    )
+                finally:
+                    _payment_in_progress.active = False
             return response
 
         httpx.Client.send = _patched_send
@@ -1468,24 +1501,32 @@ if _PRIVATE_KEY:
         _original_async_send = httpx.AsyncClient.send
 
         async def _patched_async_send(self, request, **kwargs):
+            if getattr(_payment_in_progress, "active", False):
+                return await _original_async_send(self, request, **kwargs)
+            if str(request.url.host) in _E2B_API_HOSTS:
+                return await _original_async_send(self, request, **kwargs)
             response = await _original_async_send(self, request, **kwargs)
             if response.status_code == 402:
-                account = _get_account()
-                if account is None:
-                    return response
+                _payment_in_progress.active = True
                 try:
-                    payment_requirements = response.json()
-                except Exception:
-                    return response
-                amount_usd = int(payment_requirements.get("maxAmountRequired", 0)) / 1e6
-                _check_spending_limit(amount_usd)
-                payment_header = _build_payment_header(payment_requirements)
-                request.headers["X-PAYMENT"] = payment_header
-                retry_response = await _original_async_send(self, request, **kwargs)
-                tx_hash = retry_response.headers.get("X-PAYMENT-RESPONSE", "unknown")
-                status = "success" if retry_response.status_code != 402 else "failed"
-                _log_payment(str(request.url), amount_usd, tx_hash, status)
-                return retry_response
+                    account = _get_account()
+                    if account is None:
+                        return response
+                    try:
+                        payment_requirements = response.json()
+                    except Exception:
+                        return response
+                    # USDC has 6 decimal places, not 18 like most ERC-20 tokens
+                    amount_usd = int(payment_requirements.get("maxAmountRequired", 0)) / 1e6
+                    payment_header = _build_payment_header(payment_requirements)
+                    request.headers["X-PAYMENT"] = payment_header
+                    retry_response = await _original_async_send(self, request, **kwargs)
+                    tx_hash = retry_response.headers.get("X-PAYMENT-RESPONSE", "unknown")
+                    status = "success" if retry_response.status_code != 402 else "failed"
+                    _check_and_log_payment(amount_usd, str(request.url), tx_hash, status)
+                    return retry_response
+                finally:
+                    _payment_in_progress.active = False
             return response
 
         httpx.AsyncClient.send = _patched_async_send
@@ -1535,6 +1576,8 @@ git commit -m "feat: add Python payments sandbox template with httpx x402 interc
 - Create: `templates/payments-js/init.sh`
 - Create: `templates/payments-js/e2b.toml`
 
+> Note: `loader.cjs` was removed. `NODE_OPTIONS=--import index.mjs` is used directly — see Step 4 for the explanation.
+
 - [ ] **Step 1: Create the template directory**
 
 ```bash
@@ -1561,7 +1604,12 @@ RUN echo 'if (process.env.E2B_PAYMENT_PRIVATE_KEY) require("/usr/local/lib/e2b-p
 COPY init.sh /etc/e2b-payments-init.sh
 RUN chmod +x /etc/e2b-payments-init.sh
 
-ENV NODE_OPTIONS="--require /usr/local/lib/e2b-payments/loader.cjs"
+# --import (not --require) runs the module through the ESM loader with top-level
+# await support, guaranteeing the fetch patch is installed before any user code runs.
+# --require fires a CJS require() which cannot await a dynamic import(), creating a
+# race where the first fetch() call in agent code executes before the patch lands.
+# Requires Node.js >= 18.19.
+ENV NODE_OPTIONS="--import /usr/local/lib/e2b-payments/index.mjs"
 ```
 
 - [ ] **Step 3: Create the fetch interceptor**
@@ -1575,19 +1623,31 @@ Create `templates/payments-js/e2b-payments/index.mjs`:
  * Auto-activates when E2B_PAYMENT_PRIVATE_KEY is set.
  */
 
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'fs'
-import { privateKeyToAccount } from 'viem/accounts'
+import { appendFileSync, existsSync, readFileSync } from 'fs'
+import { privateKeyToAccount, toHex } from 'viem/accounts'
 
 const PRIVATE_KEY = process.env.E2B_PAYMENT_PRIVATE_KEY
 const NETWORK = process.env.E2B_PAYMENT_NETWORK || 'base-sepolia'
 const PAYMENTS_LOG = '/tmp/.e2b-payments.jsonl'
 const SPEND_LIMIT_FILE = '/tmp/.e2b-payment-limit'
+// USDC EIP-712 domain version. Set E2B_PAYMENT_USDC_VERSION env var if Coinbase
+// upgrades the contract implementation (e.g. "2" → "2.2" as happened on Ethereum).
+const USDC_VERSION = process.env.E2B_PAYMENT_USDC_VERSION || '2'
 
 const CHAIN_IDS = { base: 8453, 'base-sepolia': 84532 }
 
 if (!PRIVATE_KEY) process.exit(0)
 
 const account = privateKeyToAccount(PRIVATE_KEY)
+
+// Promise-based mutex: Node.js is single-threaded but concurrent async operations
+// can still race when reading+writing the spend log. Serialise all payment ops.
+let _paymentQueue = Promise.resolve()
+function withPaymentLock(fn) {
+  const next = _paymentQueue.then(fn)
+  _paymentQueue = next.catch(() => {}) // don't let a rejection break the queue
+  return next
+}
 
 function checkSpendingLimit(amountUsd) {
   if (!existsSync(SPEND_LIMIT_FILE)) return
@@ -1598,43 +1658,38 @@ function checkSpendingLimit(amountUsd) {
   if (existsSync(PAYMENTS_LOG)) {
     for (const line of readFileSync(PAYMENTS_LOG, 'utf8').split('\n')) {
       if (!line.trim()) continue
-      const event = JSON.parse(line)
-      if (event.status === 'success') spent += event.amountUsd
+      try {
+        const event = JSON.parse(line)
+        // USDC has 6 decimal places, not 18 like most ERC-20 tokens
+        if (event.status === 'success') spent += event.amountUsd
+      } catch { /* skip corrupt lines */ }
     }
   }
   if (spent + amountUsd > limit) {
     throw new Error(
-      `SpendingLimitExceeded: payment of $${amountUsd.toFixed(4)} would exceed limit of $${limit.toFixed(4)} (spent: $${spent.toFixed(4)})`
+      `SpendingLimitExceeded: payment of $${amountUsd.toFixed(4)} would exceed ` +
+      `limit of $${limit.toFixed(4)} (spent: $${spent.toFixed(4)})`
     )
   }
 }
 
 function logPayment(url, amountUsd, txHash, status) {
-  const event = JSON.stringify({
-    timestamp: new Date().toISOString(),
-    url,
-    amountUsd,
-    txHash,
-    status,
-  })
+  const event = JSON.stringify({ timestamp: new Date().toISOString(), url, amountUsd, txHash, status })
   appendFileSync(PAYMENTS_LOG, event + '\n')
 }
 
 async function buildPaymentHeader(requirements) {
-  const { signTypedData } = await import('viem/accounts')
-  const { privateKeyToAccount: pta } = await import('viem/accounts')
-
   const usdcAddress = requirements.usdcAddress
   const payTo = requirements.payToAddress
   const amount = BigInt(requirements.maxAmountRequired)
   const deadline = BigInt(Math.floor(Date.now() / 1000) + (requirements.requiredDeadlineSeconds || 300))
-  const nonce = crypto.getRandomValues(new Uint8Array(32))
-  const nonceHex = '0x' + Array.from(nonce).map(b => b.toString(16).padStart(2, '0')).join('')
+  // toHex() produces a 0x-prefixed hex string — the correct Hex type for viem's bytes32
+  const nonce = toHex(crypto.getRandomValues(new Uint8Array(32)))
   const chainId = CHAIN_IDS[NETWORK] || 84532
 
   const domain = {
     name: 'USD Coin',
-    version: '2',
+    version: USDC_VERSION,
     chainId,
     verifyingContract: usdcAddress,
   }
@@ -1654,10 +1709,15 @@ async function buildPaymentHeader(requirements) {
     value: amount,
     validAfter: 0n,
     validBefore: deadline,
-    nonce: nonceHex,
+    nonce,  // already a Hex string — viem encodes bytes32 from Hex correctly
   }
 
-  const signature = await account.signTypedData({ domain, types, primaryType: 'TransferWithAuthorization', message })
+  const signature = await account.signTypedData({
+    domain,
+    types,
+    primaryType: 'TransferWithAuthorization',
+    message,
+  })
 
   const payload = {
     x402Version: 1,
@@ -1671,14 +1731,15 @@ async function buildPaymentHeader(requirements) {
         value: amount.toString(),
         validAfter: '0',
         validBefore: deadline.toString(),
-        nonce: nonceHex,
+        nonce,
       },
     },
   }
   return Buffer.from(JSON.stringify(payload)).toString('base64')
 }
 
-// Patch global fetch
+// Patch global fetch — runs synchronously at module load time so the patch is
+// guaranteed to be in place before any user code executes (safe with --import).
 const _originalFetch = globalThis.fetch
 globalThis.fetch = async function patchedFetch(input, init) {
   const response = await _originalFetch(input, init)
@@ -1691,34 +1752,37 @@ globalThis.fetch = async function patchedFetch(input, init) {
     return response
   }
 
+  // USDC has 6 decimal places, not 18 like most ERC-20 tokens
   const amountUsd = Number(BigInt(requirements.maxAmountRequired || '0')) / 1e6
-  checkSpendingLimit(amountUsd)
 
-  const paymentHeader = await buildPaymentHeader(requirements)
-  const retryInit = {
-    ...(init || {}),
-    headers: { ...(init?.headers || {}), 'X-PAYMENT': paymentHeader },
-  }
-  const retryResponse = await _originalFetch(input, retryInit)
-
-  const txHash = retryResponse.headers.get('X-PAYMENT-RESPONSE') || 'unknown'
-  const status = retryResponse.status !== 402 ? 'success' : 'failed'
-  logPayment(typeof input === 'string' ? input : input.url, amountUsd, txHash, status)
-
-  return retryResponse
+  return withPaymentLock(async () => {
+    checkSpendingLimit(amountUsd)
+    const paymentHeader = await buildPaymentHeader(requirements)
+    const retryInit = {
+      ...(init || {}),
+      headers: { ...(init?.headers || {}), 'X-PAYMENT': paymentHeader },
+    }
+    const retryResponse = await _originalFetch(input, retryInit)
+    const txHash = retryResponse.headers.get('X-PAYMENT-RESPONSE') || 'unknown'
+    const status = retryResponse.status !== 402 ? 'success' : 'failed'
+    logPayment(typeof input === 'string' ? input : input.url, amountUsd, txHash, status)
+    return retryResponse
+  })
 }
 ```
 
-- [ ] **Step 4: Create a CommonJS loader shim**
+- [ ] **Step 4: Verify no loader.cjs is needed**
 
-Create `templates/payments-js/e2b-payments/loader.cjs`:
+The original plan included a `loader.cjs` shim used via `NODE_OPTIONS=--require`. This is removed.
 
-```javascript
-// CommonJS entry point that loads the ESM interceptor
-// This file is required via NODE_OPTIONS=--require
-if (process.env.E2B_PAYMENT_PRIVATE_KEY) {
-  import('/usr/local/lib/e2b-payments/index.mjs').catch(() => {})
-}
+`--require` runs a CJS module synchronously but cannot `await` the dynamic `import()` it fires to load the ESM interceptor. The result is a race: any top-level `await fetch()` in the agent script executes on the unpatched global before the interceptor installs.
+
+`--import` (used in Step 2's Dockerfile) runs the ESM module through the full loader with top-level `await` support. The patch at the bottom of `index.mjs` (`globalThis.fetch = ...`) executes synchronously at module evaluation time, so it is guaranteed to be in place before any user code runs. No shim file needed.
+
+Confirm the base image Node.js version is >= 18.19 (when `--import` was stabilised):
+
+```bash
+node --version   # must be >= v18.19.0
 ```
 
 - [ ] **Step 5: Create init.sh**
