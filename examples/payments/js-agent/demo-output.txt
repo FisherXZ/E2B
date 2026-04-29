@@ -1,0 +1,14 @@
+Sandbox: i2v6d0r670op545v1cige
+Wallet:  0xB3a8e7C17DE11C348e4aAfbF125BC320f619D89B
+
+--- Agent output ---
+Agent querying: https://www.x402.org/protected
+If a 402 is returned, the interceptor pays automatically...
+Got response (status 200):
+<!DOCTYPE html><!--iG4wN262L9cGxZ00DHdI4--><html lang="en" class="inter_31011fd-module__jtyeTG__variable dm_mono_e7f35d60-module__cSsTJG__variable instrument_serif_7380a24a-module__Tbe2MG__variable inconsolata_f0adad5d-module__CosAvG__variable"><head><meta charSet="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5"/><link rel="preload" href="/_next/static/media/36363bfb06833f56-s.p.d8302362.woff2" as="font" crossorigin="" type="font/woff2"/><link rel="pr
+
+
+--- Payments (1) ---
+  2026-04-29T18:53:22.410Z | https://www.x402.org/protected?q=latest+AI+research+papers | $0.0100 | success
+
+Remaining: $19.9300 USDC at 0xB3a8e7C17DE11C348e4aAfbF125BC320f619D89B

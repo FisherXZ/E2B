@@ -23,7 +23,10 @@ def run_agent() -> None:
     response.raise_for_status()
 
     print(f"Got response (status {response.status_code}):")
-    print(response.json())
+    try:
+        print(response.json())
+    except ValueError:
+        print(response.text[:500])
 
 
 if __name__ == "__main__":

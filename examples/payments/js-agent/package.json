@@ -2,5 +2,8 @@
   "name": "e2b-payments-js-agent",
   "version": "1.0.0",
   "type": "module",
-  "description": "Demo JS agent that pays for x402 APIs autonomously inside an E2B sandbox"
+  "description": "Demo JS agent that pays for x402 APIs autonomously inside an E2B sandbox",
+  "dependencies": {
+    "e2b": "file:../../../packages/js-sdk"
+  }
 }

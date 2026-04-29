@@ -17,6 +17,10 @@ if (!response.ok) {
   throw new Error(`HTTP ${response.status}: ${response.statusText}`)
 }
 
-const data = await response.json()
+const text = await response.text()
 console.log(`Got response (status ${response.status}):`)
-console.log(JSON.stringify(data, null, 2))
+try {
+  console.log(JSON.stringify(JSON.parse(text), null, 2))
+} catch {
+  console.log(text.slice(0, 500))
+}
