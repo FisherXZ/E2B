@@ -74,10 +74,11 @@ class SandboxPayments:
     def get_history(self) -> List[PaymentEvent]:
         try:
             content = self._fs.read("/tmp/.e2b-payments.jsonl")
-            lines = [line for line in content.split("\n") if line.strip()]
-            return [PaymentEvent(**json.loads(line)) for line in lines]
         except Exception:
+            # File does not exist yet — no payments have happened
             return []
+        lines = [line for line in content.split("\n") if line.strip()]
+        return [PaymentEvent(**json.loads(line)) for line in lines]
 
     def get_balance(self) -> SandboxPaymentsBalance:
         import httpx
@@ -117,10 +118,11 @@ class AsyncSandboxPayments:
     async def get_history(self) -> List[PaymentEvent]:
         try:
             content = await self._fs.read("/tmp/.e2b-payments.jsonl")
-            lines = [line for line in content.split("\n") if line.strip()]
-            return [PaymentEvent(**json.loads(line)) for line in lines]
         except Exception:
+            # File does not exist yet — no payments have happened
             return []
+        lines = [line for line in content.split("\n") if line.strip()]
+        return [PaymentEvent(**json.loads(line)) for line in lines]
 
     async def get_balance(self) -> SandboxPaymentsBalance:
         import httpx

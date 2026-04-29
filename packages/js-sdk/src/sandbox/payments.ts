@@ -86,15 +86,17 @@ export class SandboxPayments {
   }
 
   async getHistory(): Promise<PaymentEvent[]> {
+    let content: string
     try {
-      const content = await this.fs.read('/tmp/.e2b-payments.jsonl')
-      return content
-        .split('\n')
-        .filter((line) => line.trim().length > 0)
-        .map((line) => JSON.parse(line) as PaymentEvent)
+      content = await this.fs.read('/tmp/.e2b-payments.jsonl')
     } catch {
+      // File does not exist yet — no payments have happened
       return []
     }
+    return content
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as PaymentEvent)
   }
 
   async getBalance(): Promise<SandboxPaymentsBalance> {
