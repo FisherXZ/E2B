@@ -1,3 +1,6 @@
+import { privateKeyToAccount } from 'viem/accounts'
+import type { Hex } from 'viem'
+
 export interface PaymentConfig {
   /** 0x-prefixed 32-byte hex private key for the wallet that pays. */
   privateKey: string
@@ -54,9 +57,6 @@ export function buildPaymentEnvs(
   }
   return envs
 }
-
-import { privateKeyToAccount } from 'viem/accounts'
-import type { Hex } from 'viem'
 
 const RPC_URLS: Record<string, string> = {
   base: 'https://mainnet.base.org',
