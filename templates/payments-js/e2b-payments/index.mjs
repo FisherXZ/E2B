@@ -51,7 +51,7 @@ if (!PRIVATE_KEY) {
         try {
           const event = JSON.parse(line)
           // USDC has 6 decimal places, not 18 like most ERC-20 tokens
-          if (event.status === 'success') spent += event.amountUsd
+          if (event.status === 'success') spent += event.amount_usd ?? event.amountUsd ?? 0
         } catch { /* skip corrupt lines */ }
       }
     }
@@ -64,7 +64,8 @@ if (!PRIVATE_KEY) {
   }
 
   function logPayment(url, amountUsd, txHash, status) {
-    const event = JSON.stringify({ timestamp: new Date().toISOString(), url, amountUsd, txHash, status })
+    // Field names match the Python PaymentEvent dataclass (snake_case) so get_history() parses both.
+    const event = JSON.stringify({ timestamp: new Date().toISOString(), url, amount_usd: amountUsd, tx_hash: txHash, status })
     appendFileSync(PAYMENTS_LOG, event + '\n')
   }
 

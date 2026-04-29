@@ -46,6 +46,9 @@ def build_payment_envs(config: PaymentConfig) -> Dict[str, str]:
     envs: Dict[str, str] = {
         "E2B_PAYMENT_PRIVATE_KEY": config.private_key,
         "E2B_PAYMENT_NETWORK": config.network,
+        # Dockerfile ENV is not propagated through envd — inject NODE_OPTIONS explicitly
+        # so the JS interceptor auto-loads on every node process in the sandbox.
+        "NODE_OPTIONS": "--import /usr/local/lib/e2b-payments/index.mjs",
     }
     if config.max_spend is not None:
         envs["E2B_PAYMENT_MAX_SPEND"] = str(config.max_spend)
