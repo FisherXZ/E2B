@@ -1,0 +1,2 @@
+dockerfile = "Dockerfile"
+template_id = "e2b-payments-py"
