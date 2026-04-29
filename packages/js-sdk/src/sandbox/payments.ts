@@ -54,3 +54,75 @@ export function buildPaymentEnvs(
   }
   return envs
 }
+
+import { privateKeyToAccount } from 'viem/accounts'
+import type { Hex } from 'viem'
+
+const RPC_URLS: Record<string, string> = {
+  base: 'https://mainnet.base.org',
+  'base-sepolia': 'https://sepolia.base.org',
+}
+
+const USDC_ADDRESSES: Record<string, string> = {
+  base: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+  'base-sepolia': '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+}
+
+interface FilesystemLike {
+  read(path: string): Promise<string>
+  write(path: string, data: string): Promise<unknown>
+}
+
+export class SandboxPayments {
+  readonly walletAddress: string
+  private readonly network: string
+  private readonly fs: FilesystemLike
+
+  constructor(config: PaymentConfig, filesystem: FilesystemLike) {
+    const account = privateKeyToAccount(config.privateKey as Hex)
+    this.walletAddress = account.address
+    this.network = config.network ?? 'base-sepolia'
+    this.fs = filesystem
+  }
+
+  async getHistory(): Promise<PaymentEvent[]> {
+    try {
+      const content = await this.fs.read('/tmp/.e2b-payments.jsonl')
+      return content
+        .split('\n')
+        .filter((line) => line.trim().length > 0)
+        .map((line) => JSON.parse(line) as PaymentEvent)
+    } catch {
+      return []
+    }
+  }
+
+  async getBalance(): Promise<SandboxPaymentsBalance> {
+    const rpcUrl = RPC_URLS[this.network]
+    const usdcAddress = USDC_ADDRESSES[this.network]
+    // ABI-encode balanceOf(address): selector 0x70a08231 + 32-byte padded address
+    const data =
+      '0x70a08231' + this.walletAddress.slice(2).toLowerCase().padStart(64, '0')
+    const response = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'eth_call',
+        params: [{ to: usdcAddress, data }, 'latest'],
+        id: 1,
+      }),
+    })
+    const { result } = (await response.json()) as { result: string }
+    // USDC has 6 decimal places (not 18 like most ERC-20 tokens)
+    const usdc = Number(BigInt(result)) / 1e6
+    return { usdc, address: this.walletAddress }
+  }
+
+  async setSpendingLimit(usd: number): Promise<void> {
+    if (usd < 0) {
+      throw new Error('Spending limit must be non-negative')
+    }
+    await this.fs.write('/tmp/.e2b-payment-limit', usd.toString())
+  }
+}
