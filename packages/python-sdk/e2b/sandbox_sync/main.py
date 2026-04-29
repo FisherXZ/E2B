@@ -18,6 +18,11 @@ from e2b.exceptions import (
     format_request_timeout_error,
 )
 from e2b.sandbox.main import SandboxOpts
+from e2b.sandbox.payments import (
+    PaymentConfig,
+    SandboxPayments,
+    build_payment_envs,
+)
 from e2b.sandbox.sandbox_api import (
     McpServer,
     SandboxLifecycle,
@@ -91,6 +96,11 @@ class Sandbox(SandboxApi):
         """
         return self._git
 
+    @property
+    def payments(self) -> Optional[SandboxPayments]:
+        """Module for managing autonomous x402 payments. Only present when sandbox was created with a payments option."""
+        return self._payments
+
     def __init__(self, **opts: Unpack[SandboxOpts]):
         """
         :deprecated: This constructor is deprecated
@@ -126,6 +136,7 @@ class Sandbox(SandboxApi):
             self._envd_version,
         )
         self._git = Git(self._commands)
+        self._payments: Optional[SandboxPayments] = None
 
     def is_running(self, request_timeout: Optional[float] = None) -> bool:
         """
@@ -176,6 +187,7 @@ class Sandbox(SandboxApi):
         network: Optional[SandboxNetworkOpts] = None,
         lifecycle: Optional[SandboxLifecycle] = None,
         volume_mounts: Optional[SandboxVolumeMount] = None,
+        payments: Optional[PaymentConfig] = None,
         **opts: Unpack[ApiParams],
     ) -> Self:
         """
@@ -193,6 +205,7 @@ class Sandbox(SandboxApi):
         :param network: Sandbox network configuration
         :param lifecycle: Sandbox lifecycle configuration — ``on_timeout``: ``"kill"`` (default) or ``"pause"``; ``auto_resume``: ``False`` (default) or ``True`` (only when ``on_timeout="pause"``). Example: ``{"on_timeout": "pause", "auto_resume": True}``
         :param volume_mounts: Dictionary mapping mount paths to Volume instances or volume names
+        :param payments: Payment configuration for x402 autonomous payments (USDC on Base).
 
         :return: A Sandbox instance for the new sandbox
 
@@ -213,12 +226,17 @@ class Sandbox(SandboxApi):
                 for path, vol in volume_mounts.items()
             ]
 
+        if payments is not None:
+            merged_envs = {**(envs or {}), **build_payment_envs(payments)}
+        else:
+            merged_envs = envs
+
         sandbox = cls._create(
             template=template,
             auto_pause=False,
             timeout=timeout,
             metadata=metadata,
-            envs=envs,
+            envs=merged_envs,
             secure=secure,
             allow_internet_access=allow_internet_access,
             mcp=mcp,
@@ -227,6 +245,9 @@ class Sandbox(SandboxApi):
             volume_mounts=transformed_mounts,
             **opts,
         )
+
+        if payments is not None:
+            sandbox._payments = SandboxPayments(payments, sandbox._filesystem)
 
         if mcp is not None:
             token = str(uuid.uuid4())
