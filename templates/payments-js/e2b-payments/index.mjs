@@ -17,6 +17,12 @@ const SPEND_LIMIT_FILE = '/tmp/.e2b-payment-limit'
 const USDC_VERSION = process.env.E2B_PAYMENT_USDC_VERSION || '2'
 
 const CHAIN_IDS = { base: 8453, 'base-sepolia': 84532 }
+// CAIP-2 aliases — x402 v2 servers use this format ("eip155:84532") instead of
+// the human-friendly name. Match accepts[] entries regardless of which form the server emits.
+const NETWORK_ALIASES = {
+  base: new Set(['base', 'eip155:8453']),
+  'base-sepolia': new Set(['base-sepolia', 'eip155:84532']),
+}
 
 if (!PRIVATE_KEY) {
   // Module imported but no credentials — exit early without patching fetch.
@@ -62,11 +68,62 @@ if (!PRIVATE_KEY) {
     appendFileSync(PAYMENTS_LOG, event + '\n')
   }
 
-  async function buildPaymentHeader(requirements) {
-    const usdcAddress = requirements.usdcAddress
-    const payTo = requirements.payToAddress
-    const amount = BigInt(requirements.maxAmountRequired)
-    const deadline = BigInt(Math.floor(Date.now() / 1000) + (requirements.requiredDeadlineSeconds || 300))
+  function decodeHeader(headerValue) {
+    if (!headerValue) return null
+    try {
+      return JSON.parse(Buffer.from(headerValue, 'base64').toString('utf8'))
+    } catch {
+      return null
+    }
+  }
+
+  function selectAccept(envelope) {
+    if (!envelope || typeof envelope !== 'object') return null
+    const accepts = envelope.accepts
+    if (Array.isArray(accepts) && accepts.length) {
+      const wanted = NETWORK_ALIASES[NETWORK] || new Set([NETWORK])
+      for (const entry of accepts) {
+        if (entry && typeof entry === 'object'
+            && wanted.has(entry.network)
+            && (entry.scheme || 'exact') === 'exact') return entry
+      }
+      for (const entry of accepts) {
+        if (entry && typeof entry === 'object' && (entry.scheme || 'exact') === 'exact') return entry
+      }
+      return typeof accepts[0] === 'object' ? accepts[0] : null
+    }
+    // Legacy v1 flat shape
+    if (envelope.asset || envelope.usdcAddress) return envelope
+    return null
+  }
+
+  async function extractRequirements(response) {
+    // x402 v2 puts requirements in the `payment-required` HTTP header (base64 JSON).
+    // Some servers also (or only) send them in the response body — try header first.
+    const headerVal = response.headers.get('payment-required')
+    let envelope = headerVal ? decodeHeader(headerVal) : null
+    if (!envelope) {
+      try {
+        envelope = await response.clone().json()
+      } catch {
+        return { entry: null, responseNetwork: null }
+      }
+    }
+    const entry = selectAccept(envelope)
+    if (!entry) return { entry: null, responseNetwork: null }
+    return { entry, responseNetwork: entry.network || NETWORK }
+  }
+
+  async function buildPaymentHeader(entry, responseNetwork) {
+    // x402 v2 field names with v1 fallbacks for compatibility with older servers
+    const usdcAddress = entry.asset || entry.usdcAddress
+    const payTo = entry.payTo || entry.payToAddress
+    if (!usdcAddress || !payTo) {
+      throw new Error('Payment requirements missing asset/payTo')
+    }
+    const amount = BigInt(entry.maxAmountRequired)
+    const timeoutSeconds = Number(entry.maxTimeoutSeconds ?? entry.requiredDeadlineSeconds ?? 300)
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + timeoutSeconds)
     // toHex() produces a 0x-prefixed hex string — the correct Hex type for viem's bytes32
     const nonce = toHex(crypto.getRandomValues(new Uint8Array(32)))
     const chainId = CHAIN_IDS[NETWORK] || 84532
@@ -105,8 +162,10 @@ if (!PRIVATE_KEY) {
 
     const payload = {
       x402Version: 1,
-      scheme: 'exact',
-      network: NETWORK,
+      scheme: entry.scheme || 'exact',
+      // Echo the server's network string verbatim — facilitators reject mismatches
+      // between what they sent in `accepts[i].network` and what we send back.
+      network: responseNetwork,
       payload: {
         signature,
         authorization: {
@@ -129,19 +188,15 @@ if (!PRIVATE_KEY) {
     const response = await _originalFetch(input, init)
     if (response.status !== 402) return response
 
-    let requirements
-    try {
-      requirements = await response.clone().json()
-    } catch {
-      return response
-    }
+    const { entry, responseNetwork } = await extractRequirements(response)
+    if (!entry) return response
 
     // USDC has 6 decimal places, not 18 like most ERC-20 tokens
-    const amountUsd = Number(BigInt(requirements.maxAmountRequired || '0')) / 1e6
+    const amountUsd = Number(BigInt(entry.maxAmountRequired || '0')) / 1e6
 
     return withPaymentLock(async () => {
       checkSpendingLimit(amountUsd)
-      const paymentHeader = await buildPaymentHeader(requirements)
+      const paymentHeader = await buildPaymentHeader(entry, responseNetwork)
       const retryInit = {
         ...(init || {}),
         headers: { ...(init?.headers || {}), 'X-PAYMENT': paymentHeader },
