@@ -70,7 +70,13 @@ from .sandbox.filesystem.watch_handle import (
 from .sandbox._git import GitBranches, GitFileStatus, GitStatus
 from .sandbox_sync.git import Git
 from .sandbox.network import ALL_TRAFFIC
-from .sandbox.payments import PaymentConfig, PaymentEvent, SandboxPaymentsBalance
+from .sandbox.payments import (
+    AsyncSandboxPayments,
+    PaymentConfig,
+    PaymentEvent,
+    SandboxPayments,
+    SandboxPaymentsBalance,
+)
 from .sandbox.signature import get_signature
 from .sandbox.sandbox_api import (
     GitHubMcpServer,
@@ -227,8 +233,10 @@ __all__ = [
     "LogEntryLevel",
     "default_build_logger",
     # Payments
+    "AsyncSandboxPayments",
     "PaymentConfig",
     "PaymentEvent",
+    "SandboxPayments",
     "SandboxPaymentsBalance",
     # MCP
     "McpServer",
