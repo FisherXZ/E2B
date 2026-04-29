@@ -213,6 +213,8 @@ class Sandbox(SandboxApi):
         """
         if not template and mcp is not None:
             template = cls.default_mcp_template
+        elif not template and payments is not None:
+            template = "e2b-payments-py"
         elif not template:
             template = cls.default_template
 

@@ -77,6 +77,8 @@ export interface SandboxUrlOpts {
 export class Sandbox extends SandboxApi {
   protected static readonly defaultTemplate: string = 'base'
   protected static readonly defaultMcpTemplate: string = 'mcp-gateway'
+  protected static readonly defaultPaymentsPyTemplate: string = 'e2b-payments-py'
+  protected static readonly defaultPaymentsJsTemplate: string = 'e2b-payments-js'
   protected static readonly defaultSandboxTimeoutMs = DEFAULT_SANDBOX_TIMEOUT_MS
 
   /**
@@ -297,7 +299,9 @@ export class Sandbox extends SandboxApi {
         : {
             template: templateOrOpts?.mcp
               ? this.defaultMcpTemplate
-              : this.defaultTemplate,
+              : templateOrOpts?.payments
+                ? this.defaultPaymentsJsTemplate
+                : this.defaultTemplate,
             sandboxOpts: templateOrOpts,
           }
 
