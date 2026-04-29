@@ -13,6 +13,12 @@ import { Commands, Pty } from './commands'
 import { Filesystem } from './filesystem'
 import { Git } from './git'
 import {
+  SandboxPayments,
+  validatePaymentConfig,
+  buildPaymentEnvs,
+} from './payments'
+import type { PaymentConfig } from './payments'
+import {
   SandboxOpts,
   SandboxConnectOpts,
   SandboxMetricsOpts,
@@ -91,6 +97,12 @@ export class Sandbox extends SandboxApi {
   readonly git: Git
 
   /**
+   * Module for managing autonomous x402 payments from the sandbox.
+   * Only present when the sandbox was created with a `payments` option.
+   */
+  readonly payments?: SandboxPayments
+
+  /**
    * Unique identifier of the sandbox.
    */
   readonly sandboxId: string
@@ -129,6 +141,7 @@ export class Sandbox extends SandboxApi {
       envdVersion: string
       envdAccessToken?: string
       trafficAccessToken?: string
+      paymentsConfig?: PaymentConfig
     }
   ) {
     super()
@@ -211,6 +224,15 @@ export class Sandbox extends SandboxApi {
       version: opts.envdVersion,
     })
     this.git = new Git(this.commands)
+    if (opts.paymentsConfig) {
+      ;(this as { payments?: SandboxPayments }).payments = new SandboxPayments(
+        opts.paymentsConfig,
+        {
+          read: (path) => this.files.read(path),
+          write: (path, data) => this.files.write(path, data),
+        }
+      )
+    }
   }
 
   /**
@@ -288,13 +310,31 @@ export class Sandbox extends SandboxApi {
       }) as InstanceType<S>
     }
 
+    if (sandboxOpts?.payments) {
+      validatePaymentConfig(sandboxOpts.payments)
+    }
+
+    const mergedOpts = sandboxOpts?.payments
+      ? {
+          ...sandboxOpts,
+          envs: {
+            ...sandboxOpts.envs,
+            ...buildPaymentEnvs(sandboxOpts.payments),
+          },
+        }
+      : sandboxOpts
+
     const sandboxInfo = await SandboxApi.createSandbox(
       template,
-      sandboxOpts?.timeoutMs ?? this.defaultSandboxTimeoutMs,
-      sandboxOpts
+      mergedOpts?.timeoutMs ?? this.defaultSandboxTimeoutMs,
+      mergedOpts
     )
 
-    const sandbox = new this({ ...sandboxInfo, ...config }) as InstanceType<S>
+    const sandbox = new this({
+      ...sandboxInfo,
+      ...config,
+      paymentsConfig: sandboxOpts?.payments,
+    }) as InstanceType<S>
 
     if (sandboxOpts?.mcp) {
       sandbox.mcpToken = crypto.randomUUID()

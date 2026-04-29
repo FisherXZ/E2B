@@ -9,6 +9,7 @@ import { SandboxNotFoundError, TemplateError } from '../errors'
 import { timeoutToSeconds } from '../utils'
 import type { Volume } from '../volume'
 import type { McpServer as BaseMcpServer } from './mcp'
+import type { PaymentConfig } from './payments'
 
 /**
  * Extended MCP server configuration that includes base servers
@@ -123,6 +124,12 @@ export interface SandboxOpts extends ConnectionOpts {
    * @default {}
    */
   envs?: Record<string, string>
+
+  /**
+   * Payment configuration for x402 autonomous payments.
+   * Enables the sandbox to autonomously pay for external APIs using USDC on Base.
+   */
+  payments?: PaymentConfig
 
   /**
    * Timeout for the sandbox in **milliseconds**.
