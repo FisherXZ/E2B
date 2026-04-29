@@ -106,31 +106,37 @@ if (!PRIVATE_KEY) {
       try {
         envelope = await response.clone().json()
       } catch {
-        return { entry: null, responseNetwork: null }
+        return { entry: null, responseNetwork: null, resource: null }
       }
     }
     const entry = selectAccept(envelope)
-    if (!entry) return { entry: null, responseNetwork: null }
-    return { entry, responseNetwork: entry.network || NETWORK }
+    if (!entry) return { entry: null, responseNetwork: null, resource: null }
+    const resource = envelope.resource || null
+    return { entry, responseNetwork: entry.network || NETWORK, resource }
   }
 
-  async function buildPaymentHeader(entry, responseNetwork) {
-    // x402 v2 field names with v1 fallbacks for compatibility with older servers
+  async function buildPaymentHeader(entry, responseNetwork, resource) {
     const usdcAddress = entry.asset || entry.usdcAddress
     const payTo = entry.payTo || entry.payToAddress
     if (!usdcAddress || !payTo) {
       throw new Error('Payment requirements missing asset/payTo')
     }
-    const amount = BigInt(entry.maxAmountRequired)
+    // x402 v2 servers use "amount"; v1 servers use "maxAmountRequired"
+    const rawAmount = 'maxAmountRequired' in entry ? entry.maxAmountRequired : entry.amount
+    if (rawAmount == null) throw new Error('Payment requirements missing amount/maxAmountRequired')
+    const amount = BigInt(rawAmount)
     const timeoutSeconds = Number(entry.maxTimeoutSeconds ?? entry.requiredDeadlineSeconds ?? 300)
     const deadline = BigInt(Math.floor(Date.now() / 1000) + timeoutSeconds)
     // toHex() produces a 0x-prefixed hex string — the correct Hex type for viem's bytes32
     const nonce = toHex(crypto.getRandomValues(new Uint8Array(32)))
     const chainId = CHAIN_IDS[NETWORK] || 84532
 
+    // Use EIP-712 domain name from server's extra.name (verified against on-chain
+    // DOMAIN_SEPARATOR). Base Sepolia USDC uses "USDC", not "USD Coin".
+    const domainName = entry.extra?.name || 'USDC'
     const domain = {
-      name: 'USD Coin',
-      version: USDC_VERSION,
+      name: domainName,
+      version: entry.extra?.version || USDC_VERSION,
       chainId,
       verifyingContract: usdcAddress,
     }
@@ -160,12 +166,10 @@ if (!PRIVATE_KEY) {
       message,
     })
 
-    const payload = {
-      x402Version: 1,
-      scheme: entry.scheme || 'exact',
-      // Echo the server's network string verbatim — facilitators reject mismatches
-      // between what they sent in `accepts[i].network` and what we send back.
-      network: responseNetwork,
+    // x402 v2: { accepted, payload } envelope sent in PAYMENT-SIGNATURE header.
+    const outer = {
+      x402Version: 2,
+      accepted: entry,
       payload: {
         signature,
         authorization: {
@@ -178,7 +182,8 @@ if (!PRIVATE_KEY) {
         },
       },
     }
-    return Buffer.from(JSON.stringify(payload)).toString('base64')
+    if (resource) outer.resource = resource
+    return Buffer.from(JSON.stringify(outer)).toString('base64')
   }
 
   // Patch global fetch — runs synchronously at module load time so the patch is
@@ -188,21 +193,26 @@ if (!PRIVATE_KEY) {
     const response = await _originalFetch(input, init)
     if (response.status !== 402) return response
 
-    const { entry, responseNetwork } = await extractRequirements(response)
+    const { entry, responseNetwork, resource } = await extractRequirements(response)
     if (!entry) return response
 
-    // USDC has 6 decimal places, not 18 like most ERC-20 tokens
-    const amountUsd = Number(BigInt(entry.maxAmountRequired || '0')) / 1e6
+    // x402 v2 uses "amount"; v1 uses "maxAmountRequired". USDC has 6 decimal places.
+    const rawAmount = 'maxAmountRequired' in entry ? entry.maxAmountRequired : (entry.amount || '0')
+    const amountUsd = Number(BigInt(rawAmount)) / 1e6
 
     return withPaymentLock(async () => {
       checkSpendingLimit(amountUsd)
-      const paymentHeader = await buildPaymentHeader(entry, responseNetwork)
+      const paymentHeader = await buildPaymentHeader(entry, responseNetwork, resource)
       const retryInit = {
         ...(init || {}),
-        headers: { ...(init?.headers || {}), 'X-PAYMENT': paymentHeader },
+        // x402 v2 uses PAYMENT-SIGNATURE header; v1 used X-PAYMENT
+        headers: { ...(init?.headers || {}), 'PAYMENT-SIGNATURE': paymentHeader },
       }
       const retryResponse = await _originalFetch(input, retryInit)
-      const txHash = retryResponse.headers.get('X-PAYMENT-RESPONSE') || 'unknown'
+      // x402 v2 uses PAYMENT-RESPONSE header; v1 used X-PAYMENT-RESPONSE
+      const txHash = retryResponse.headers.get('PAYMENT-RESPONSE')
+        || retryResponse.headers.get('X-PAYMENT-RESPONSE')
+        || 'unknown'
       const status = retryResponse.status !== 402 ? 'success' : 'failed'
       logPayment(typeof input === 'string' ? input : input.url, amountUsd, txHash, status)
       return retryResponse

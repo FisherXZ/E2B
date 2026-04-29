@@ -136,12 +136,11 @@ def _select_accept(envelope: dict) -> Optional[dict]:
     return None
 
 
-def _extract_requirements(response) -> Tuple[Optional[dict], Optional[str]]:
+def _extract_requirements(response) -> Tuple[Optional[dict], Optional[str], Optional[dict]]:
     """Pull payment requirements from the 402 response.
 
     Prefers the `payment-required` HTTP header (x402 v2), falls back to the response body.
-    Returns (selected_accept_entry, response_network) — response_network is what we should
-    echo back in the X-PAYMENT payload's `network` field so the server accepts our reply.
+    Returns (selected_accept_entry, response_network, resource_info).
     """
     header_val = response.headers.get("payment-required") or response.headers.get("Payment-Required")
     envelope = _decode_header(header_val) if header_val else None
@@ -149,26 +148,32 @@ def _extract_requirements(response) -> Tuple[Optional[dict], Optional[str]]:
         try:
             envelope = response.json()
         except Exception:
-            return None, None
+            return None, None, None
     if not isinstance(envelope, dict):
-        return None, None
+        return None, None, None
     entry = _select_accept(envelope)
     if entry is None:
-        return None, None
-    return entry, entry.get("network", _NETWORK)
+        return None, None, None
+    resource = envelope.get("resource")
+    return entry, entry.get("network", _NETWORK), resource
 
 
 def _read_amount_usd(entry: dict) -> float:
     """USDC has 6 decimal places, not 18 like most ERC-20 tokens."""
-    raw = entry.get("maxAmountRequired", 0)
+    # x402 v2 servers use "amount"; v1 servers use "maxAmountRequired"
+    raw = entry.get("maxAmountRequired") if "maxAmountRequired" in entry else entry.get("amount", 0)
     try:
         return int(raw) / 1e6
     except (TypeError, ValueError):
         return 0.0
 
 
-def _build_payment_header(entry: dict, response_network: str) -> str:
-    """Build base64-encoded X-PAYMENT header using EIP-3009 TransferWithAuthorization."""
+def _build_payment_header(entry: dict, response_network: str, resource: Optional[dict] = None) -> str:
+    """Build base64-encoded PAYMENT-SIGNATURE header using EIP-3009 TransferWithAuthorization.
+
+    x402 v2: outer payload uses { accepted, payload } structure sent in PAYMENT-SIGNATURE header.
+    x402 v1: outer payload uses { scheme, network, payload } structure sent in X-PAYMENT header.
+    """
     from eth_account import Account
     import secrets as _secrets
 
@@ -181,7 +186,11 @@ def _build_payment_header(entry: dict, response_network: str) -> str:
     pay_to = entry.get("payTo") or entry.get("payToAddress")
     if not usdc_address or not pay_to:
         raise RuntimeError("Payment requirements missing asset/payTo")
-    amount = int(entry["maxAmountRequired"])
+    # x402 v2 servers use "amount"; v1 servers use "maxAmountRequired"
+    amount_raw = entry.get("maxAmountRequired") if "maxAmountRequired" in entry else entry.get("amount")
+    if amount_raw is None:
+        raise RuntimeError("Payment requirements missing amount/maxAmountRequired")
+    amount = int(amount_raw)
     timeout_seconds = int(entry.get("maxTimeoutSeconds") or entry.get("requiredDeadlineSeconds") or 300)
     deadline = int(time.time()) + timeout_seconds
     # bytes32 nonce: 32 cryptographically random bytes
@@ -194,7 +203,7 @@ def _build_payment_header(entry: dict, response_network: str) -> str:
     # eth-account raises ValueError("EIP712Domain type is not allowed in message_types")
     # if it does. The full_message= kwarg form was removed in 0.9.0.
     domain_data = {
-        "name": "USD Coin",
+        "name": "USDC",
         "version": _USDC_VERSION,
         "chainId": chain_id,
         "verifyingContract": usdc_address,
@@ -225,39 +234,44 @@ def _build_payment_header(entry: dict, response_network: str) -> str:
         message_data=message_data,
     )
 
-    payload = {
-        "x402Version": 1,
-        "scheme": entry.get("scheme", "exact"),
-        # Echo the server's network string verbatim — facilitators reject mismatches
-        # between what they sent in `accepts[i].network` and what we send back.
-        "network": response_network,
-        "payload": {
-            "signature": "0x" + signed.signature.hex(),
-            "authorization": {
-                "from": account.address,
-                "to": pay_to,
-                "value": str(amount),
-                "validAfter": "0",
-                "validBefore": str(deadline),
-                "nonce": "0x" + nonce.hex(),
-            },
+    inner_payload = {
+        "signature": "0x" + signed.signature.hex(),
+        "authorization": {
+            "from": account.address,
+            "to": pay_to,
+            "value": str(amount),
+            "validAfter": "0",
+            "validBefore": str(deadline),
+            "nonce": "0x" + nonce.hex(),
         },
     }
-    return base64.b64encode(json.dumps(payload).encode()).decode()
+
+    # x402 v2 wraps the selected requirements in `accepted` and uses PAYMENT-SIGNATURE header.
+    # x402 v1 legacy format embeds scheme/network at top level and uses X-PAYMENT header.
+    outer = {
+        "x402Version": 2,
+        "accepted": entry,
+        "payload": inner_payload,
+    }
+    if resource:
+        outer["resource"] = resource
+    return base64.b64encode(json.dumps(outer).encode()).decode()
 
 
 def _handle_sync_402(response, request_fn, original_request):
     """Handle a 402 response: sign payment and retry."""
-    entry, response_network = _extract_requirements(response)
+    entry, response_network, resource = _extract_requirements(response)
     if entry is None:
         return response
 
     amount_usd = _read_amount_usd(entry)
-    payment_header = _build_payment_header(entry, response_network)
-    original_request.headers["X-PAYMENT"] = payment_header
+    payment_header = _build_payment_header(entry, response_network, resource)
+    # x402 v2 uses PAYMENT-SIGNATURE; v1 used X-PAYMENT
+    original_request.headers["PAYMENT-SIGNATURE"] = payment_header
     retry_response = request_fn(original_request)
 
-    tx_hash = retry_response.headers.get("X-PAYMENT-RESPONSE", "unknown")
+    # x402 v2 uses PAYMENT-RESPONSE; v1 used X-PAYMENT-RESPONSE
+    tx_hash = retry_response.headers.get("PAYMENT-RESPONSE") or retry_response.headers.get("X-PAYMENT-RESPONSE", "unknown")
     status = "success" if retry_response.status_code != 402 else "failed"
     _check_and_log_payment(amount_usd, str(original_request.url), tx_hash, status)
 
@@ -307,14 +321,14 @@ if _PRIVATE_KEY:
                     account = _get_account()
                     if account is None:
                         return response
-                    entry, response_network = _extract_requirements(response)
+                    entry, response_network, resource = _extract_requirements(response)
                     if entry is None:
                         return response
                     amount_usd = _read_amount_usd(entry)
-                    payment_header = _build_payment_header(entry, response_network)
-                    request.headers["X-PAYMENT"] = payment_header
+                    payment_header = _build_payment_header(entry, response_network, resource)
+                    request.headers["PAYMENT-SIGNATURE"] = payment_header
                     retry_response = await _original_async_send(self, request, **kwargs)
-                    tx_hash = retry_response.headers.get("X-PAYMENT-RESPONSE", "unknown")
+                    tx_hash = retry_response.headers.get("PAYMENT-RESPONSE") or retry_response.headers.get("X-PAYMENT-RESPONSE", "unknown")
                     status = "success" if retry_response.status_code != 402 else "failed"
                     _check_and_log_payment(amount_usd, str(request.url), tx_hash, status)
                     return retry_response

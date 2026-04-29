@@ -1,13 +1,14 @@
 FROM e2bdev/code-interpreter:latest
 
-# Install viem for x402 payment signing
-RUN npm install -g viem
+USER root
 
 # Copy payment interceptor
 COPY e2b-payments/ /usr/local/lib/e2b-payments/
 
-COPY init.sh /etc/e2b-payments-init.sh
-RUN chmod +x /etc/e2b-payments-init.sh
+# Install viem locally so ESM resolution finds it relative to the interceptor
+RUN cd /usr/local/lib/e2b-payments && npm install viem
+
+COPY --chmod=755 init.sh /etc/e2b-payments-init.sh
 
 # --import (not --require) runs the module through the ESM loader with top-level
 # await support, guaranteeing the fetch patch is installed before any user code runs.

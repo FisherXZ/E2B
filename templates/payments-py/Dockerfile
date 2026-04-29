@@ -1,15 +1,19 @@
 FROM e2bdev/code-interpreter:latest
 
+USER root
+
 # Install x402 payment dependencies
 RUN pip install eth-account>=0.11.0 httpx>=0.27.0
 
-# Copy the e2b_payments interceptor package
-COPY e2b_payments/ /usr/local/lib/python3.11/site-packages/e2b_payments/
+# Copy the e2b_payments interceptor to the active Python's site-packages (version-agnostic)
+COPY e2b_payments/ /tmp/e2b_payments/
+RUN dest="$(python3 -c 'import site; print(site.getsitepackages()[0])')/e2b_payments" && \
+    cp -r /tmp/e2b_payments/. "$dest/" && \
+    rm -rf /tmp/e2b_payments
 
 # Copy and set up init script
-COPY init.sh /etc/e2b-payments-init.sh
-RUN chmod +x /etc/e2b-payments-init.sh
+COPY --chmod=755 init.sh /etc/e2b-payments-init.sh
 
-# Auto-activate interceptor for every Python process if credentials are present
-RUN echo 'import e2b_payments' >> /usr/lib/python3/dist-packages/sitecustomize.py || \
-    echo 'import e2b_payments' > /usr/local/lib/python3.11/site-packages/sitecustomize.py
+# Auto-activate interceptor: append to the sitecustomize.py this Python version actually loads.
+# Use echo (not python -c) to avoid \n escape handling differences across sh/Docker layers.
+RUN echo 'import e2b_payments' >> "$(python3 -c 'import site; print(site.getsitepackages()[0])')/sitecustomize.py"
