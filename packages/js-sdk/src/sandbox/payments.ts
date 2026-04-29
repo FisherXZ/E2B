@@ -99,7 +99,18 @@ export class SandboxPayments {
     return content
       .split('\n')
       .filter((line) => line.trim().length > 0)
-      .map((line) => JSON.parse(line) as PaymentEvent)
+      .map((line) => {
+        // Interceptor writes snake_case keys to match the Python PaymentEvent
+        // dataclass so a single JSONL file is parseable by both SDKs.
+        const raw = JSON.parse(line)
+        return {
+          timestamp: raw.timestamp,
+          url: raw.url,
+          amountUsd: raw.amount_usd ?? raw.amountUsd,
+          txHash: raw.tx_hash ?? raw.txHash,
+          status: raw.status,
+        } as PaymentEvent
+      })
   }
 
   async getBalance(): Promise<SandboxPaymentsBalance> {
