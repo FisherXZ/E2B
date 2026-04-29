@@ -51,6 +51,9 @@ export function buildPaymentEnvs(
   const envs: Record<string, string> = {
     E2B_PAYMENT_PRIVATE_KEY: config.privateKey,
     E2B_PAYMENT_NETWORK: config.network ?? 'base-sepolia',
+    // Dockerfile ENV is not propagated through envd — inject NODE_OPTIONS explicitly
+    // so the JS interceptor auto-loads on every node process in the sandbox.
+    NODE_OPTIONS: '--import /usr/local/lib/e2b-payments/index.mjs',
   }
   if (config.maxSpend !== undefined) {
     envs['E2B_PAYMENT_MAX_SPEND'] = config.maxSpend.toString()
