@@ -31,7 +31,10 @@ describe('validatePaymentConfig', () => {
 
   it('rejects an unknown network', () => {
     expect(() =>
-      validatePaymentConfig({ privateKey: VALID_KEY, network: 'ethereum' as any })
+      validatePaymentConfig({
+        privateKey: VALID_KEY,
+        network: 'ethereum' as any,
+      })
     ).toThrow('network must be')
   })
 
@@ -163,7 +166,10 @@ describe('SandboxPayments.setSpendingLimit', () => {
 
 describe('SandboxPayments.walletAddress', () => {
   it('derives the correct address from the test private key', () => {
-    const sp = new SandboxPayments({ privateKey: TEST_KEY }, makeFakeFilesystem())
+    const sp = new SandboxPayments(
+      { privateKey: TEST_KEY },
+      makeFakeFilesystem()
+    )
     expect(sp.walletAddress.toLowerCase()).toBe(
       '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266'
     )

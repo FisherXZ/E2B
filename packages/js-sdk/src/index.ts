@@ -67,7 +67,11 @@ export type {
 
 export type { McpServer } from './sandbox/mcp'
 
-export type { PaymentConfig, PaymentEvent, SandboxPaymentsBalance } from './sandbox/payments'
+export type {
+  PaymentConfig,
+  PaymentEvent,
+  SandboxPaymentsBalance,
+} from './sandbox/payments'
 export { SandboxPayments } from './sandbox/payments'
 
 export { ALL_TRAFFIC } from './sandbox/network'
